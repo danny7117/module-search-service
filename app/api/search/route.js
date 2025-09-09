@@ -1,4 +1,3 @@
-// app/api/search/route.js
 import { NextResponse } from 'next/server';
 
 const TIMEOUT_MS = Number(process.env.CATALOG_TIMEOUT_MS || 1500);
@@ -29,8 +28,10 @@ export async function GET(req) {
     return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
   }
 
+  // 讀 catalog.json
   const catalog = await fetchJSON(catalogUrl, TIMEOUT_MS);
 
+  // 允許群組（可不設，空的代表全抓）
   const allowedGroups = (process.env.MODULES_GROUPS || '')
     .split(',')
     .map(s => s.trim())
@@ -41,6 +42,7 @@ export async function GET(req) {
     ? groups.filter(g => allowedGroups.includes(g.id))
     : groups;
 
+  // 逐個 group 讀 *_modules_all.json
   const lists = await Promise.allSettled(
     groupList.map(g => {
       const u = new URL(g.path, catalogUrl).toString(); // 支援相對路徑
@@ -48,6 +50,7 @@ export async function GET(req) {
     }),
   );
 
+  // 合併 modules
   const modules = [];
   for (const r of lists) {
     if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.modules)) {
@@ -55,6 +58,7 @@ export async function GET(req) {
     }
   }
 
+  // 關鍵字過濾 + 限制數量
   const items = modules
     .filter(m => {
       if (!q) return true;
