@@ -1,42 +1,67 @@
+// app/api/search/route.js
 import { NextResponse } from 'next/server';
-type Group = { id: string; path: string };
-type Catalog = { groups: Group[] };
-type Mod = { id?: string; name?: string; tags?: string[]; [k: string]: any };
 
-const UA = 'ModuleSearch/1.0';
-async function j<T>(url: string) {
-  const r = await fetch(url, { cache: 'no-store', headers: { 'User-Agent': UA } });
-  if (!r.ok) throw new Error(`fetch ${url} ${r.status}`);
-  return r.json() as Promise<T>;
+const TIMEOUT_MS = Number(process.env.CATALOG_TIMEOUT_MS || 1500);
+
+async function fetchJSON(url, timeoutMs) {
+  const ac = new AbortController();
+  const t = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      cache: 'no-store',
+      signal: ac.signal,
+      headers: { 'User-Agent': 'module-search/1' },
+    });
+    if (!res.ok) throw new Error(`Fetch ${url} failed ${res.status}`);
+    return await res.json();
+  } finally {
+    clearTimeout(t);
+  }
 }
 
-export async function GET(req: Request) {
-  const u = new URL(req.url);
-  const q = (u.searchParams.get('q') || '').toLowerCase().trim();
-  const limit = Number(u.searchParams.get('limit') || 20);
-  const indexUrl = process.env.CATALOG_URL;
-  if (!indexUrl) return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
+export async function GET(req) {
+  const { searchParams } = new URL(req.url);
+  const q = (searchParams.get('q') || '').toLowerCase().trim();
+  const limit = Math.min(Number(searchParams.get('limit') || 20), 50);
 
-  const catalog = await j<Catalog>(indexUrl);
-  const idx = new URL(indexUrl); idx.search = '';
-  const base = idx.toString().replace(/\/[^/]+$/, '/');
-
-  const all: Mod[] = [];
-  for (const g of catalog.groups || []) {
-    const url = g.path.startsWith('http') ? g.path : base + g.path;
-    try {
-      const gj = await j<any>(url);
-      const arr: Mod[] = Array.isArray(gj) ? gj : Array.isArray(gj?.modules) ? gj.modules : [];
-      all.push(...arr);
-    } catch {}
+  const catalogUrl = process.env.CATALOG_URL;
+  if (!catalogUrl) {
+    return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
   }
 
-  const items = (q
-    ? all.filter(m => {
-        const s = `${m.id || ''} ${m.name || ''} ${(m.tags || []).join(' ')}`.toLowerCase();
-        return s.includes(q);
-      })
-    : all).slice(0, isFinite(limit) ? limit : 20);
+  const catalog = await fetchJSON(catalogUrl, TIMEOUT_MS);
 
-  return NextResponse.json({ items }, { headers: { 'x-source': 'module-search-service' } });
+  const allowedGroups = (process.env.MODULES_GROUPS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const groups = Array.isArray(catalog.groups) ? catalog.groups : [];
+  const groupList = allowedGroups.length
+    ? groups.filter(g => allowedGroups.includes(g.id))
+    : groups;
+
+  const lists = await Promise.allSettled(
+    groupList.map(g => {
+      const u = new URL(g.path, catalogUrl).toString(); // 支援相對路徑
+      return fetchJSON(u, TIMEOUT_MS);
+    }),
+  );
+
+  const modules = [];
+  for (const r of lists) {
+    if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.modules)) {
+      modules.push(...r.value.modules);
+    }
+  }
+
+  const items = modules
+    .filter(m => {
+      if (!q) return true;
+      const hay = `${m.id} ${(m.name || '')} ${(m.tags || []).join(' ')}`.toLowerCase();
+      return hay.includes(q);
+    })
+    .slice(0, limit);
+
+  return NextResponse.json({ items }, { headers: { 'Cache-Control': 'no-store' } });
 }
