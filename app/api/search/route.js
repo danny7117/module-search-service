@@ -1,71 +1,71 @@
 import { NextResponse } from 'next/server';
 
-const TIMEOUT_MS = Number(process.env.CATALOG_TIMEOUT_MS || 1500);
+export const dynamic = 'force-dynamic';  // 每次打都不要用舊快取
+export const runtime = 'nodejs';         // 用 Node runtime，避免 Edge 某些 API 不相容
 
-async function fetchJSON(url, timeoutMs) {
-  const ac = new AbortController();
-  const t = setTimeout(() => ac.abort(), timeoutMs);
-  try {
-    const res = await fetch(url, {
-      cache: 'no-store',
-      signal: ac.signal,
-      headers: { 'User-Agent': 'module-search/1' },
-    });
-    if (!res.ok) throw new Error(`Fetch ${url} failed ${res.status}`);
-    return await res.json();
-  } finally {
-    clearTimeout(t);
-  }
+const norm = (s) => (s || '').toString().toLowerCase();
+
+function pickGroups(catalog, groupsEnv) {
+  if (!groupsEnv) return catalog.groups || [];
+  const want = new Set(groupsEnv.split(',').map(s => s.trim()).filter(Boolean));
+  return (catalog.groups || []).filter(g => want.has(g.id));
 }
 
 export async function GET(req) {
-  const { searchParams } = new URL(req.url);
-  const q = (searchParams.get('q') || '').toLowerCase().trim();
-  const limit = Math.min(Number(searchParams.get('limit') || 20), 50);
+  try {
+    const { searchParams } = new URL(req.url);
+    const q = norm(searchParams.get('q'));
+    const limitRaw = parseInt(searchParams.get('limit') || '20', 10);
+    const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(50, limitRaw)) : 20;
 
-  const catalogUrl = process.env.CATALOG_URL;
-  if (!catalogUrl) {
-    return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
-  }
-
-  // 讀 catalog.json
-  const catalog = await fetchJSON(catalogUrl, TIMEOUT_MS);
-
-  // 允許群組（可不設，空的代表全抓）
-  const allowedGroups = (process.env.MODULES_GROUPS || '')
-    .split(',')
-    .map(s => s.trim())
-    .filter(Boolean);
-
-  const groups = Array.isArray(catalog.groups) ? catalog.groups : [];
-  const groupList = allowedGroups.length
-    ? groups.filter(g => allowedGroups.includes(g.id))
-    : groups;
-
-  // 逐個 group 讀 *_modules_all.json
-  const lists = await Promise.allSettled(
-    groupList.map(g => {
-      const u = new URL(g.path, catalogUrl).toString(); // 支援相對路徑
-      return fetchJSON(u, TIMEOUT_MS);
-    }),
-  );
-
-  // 合併 modules
-  const modules = [];
-  for (const r of lists) {
-    if (r.status === 'fulfilled' && r.value && Array.isArray(r.value.modules)) {
-      modules.push(...r.value.modules);
+    const catalogUrl = process.env.CATALOG_URL;
+    if (!catalogUrl) {
+      return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
     }
+
+    // 加 _ts 避免 CDN 舊快取
+    const ts = searchParams.get('_ts') || Date.now();
+    const catUrl = catalogUrl + (catalogUrl.includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
+
+    const catRes = await fetch(catUrl, { cache: 'no-store' });
+    if (!catRes.ok) throw new Error(`catalog fetch failed: ${catRes.status}`);
+    const catalog = await catRes.json();
+
+    // 以 catalog.json 的目錄當 base，去抓 groups 裡每個 path 指向的 *_modules_all.json
+    const base = new URL('.', catalogUrl);
+    const groups = pickGroups(catalog, process.env.MODULES_GROUPS);
+    const allModules = [];
+
+    for (const g of groups) {
+      try {
+        const url = new URL(g.path, base);
+        const urlStr = url.toString() + (url.toString().includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
+        const r = await fetch(urlStr, { cache: 'no-store' });
+        if (!r.ok) continue;
+        const data = await r.json();
+        const arr = Array.isArray(data?.modules) ? data.modules : [];
+        for (const m of arr) allModules.push(m);
+      } catch {}
+    }
+
+    let items = allModules;
+    if (q) {
+      items = allModules.filter((m) => {
+        const id = norm(m.id);
+        const name = norm(m.name);
+        const tags = Array.isArray(m.tags) ? m.tags.map(norm) : [];
+        return id.includes(q) || name.includes(q) || tags.some(t => t.includes(q));
+      });
+    }
+
+    return NextResponse.json(
+      { items: items.slice(0, limit) },
+      { headers: { 'Cache-Control': 'no-store' } }
+    );
+  } catch (err) {
+    return NextResponse.json(
+      { items: [], error: String(err?.message || err) },
+      { status: 500 }
+    );
   }
-
-  // 關鍵字過濾 + 限制數量
-  const items = modules
-    .filter(m => {
-      if (!q) return true;
-      const hay = `${m.id} ${(m.name || '')} ${(m.tags || []).join(' ')}`.toLowerCase();
-      return hay.includes(q);
-    })
-    .slice(0, limit);
-
-  return NextResponse.json({ items }, { headers: { 'Cache-Control': 'no-store' } });
 }
