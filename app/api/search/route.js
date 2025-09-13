@@ -1,93 +1,76 @@
+// module-search-service/app/api/search/route.js
 import { NextResponse } from 'next/server';
 
-export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
+/** 清掉 BOM、註解、尾逗號，避免 JSON 解析失敗 */
+function sanitizeJson(text) {
+  return text
+    .replace(/^\uFEFF/, '')            // UTF-8 BOM
+    .replace(/\/\/.*$/gm, '')          // // 單行註解
+    .replace(/\/\*[\s\S]*?\*\//g, '')  // /* 多行註解 */
+    .replace(/,\s*([}\]])/g, '$1');    // 尾逗號
+}
 
-const norm = (s) => (s || '').toString().toLowerCase();
-const nowTs = () => Date.now();
-
-function rawBaseFromCatalog(catalogUrl) {
+async function fetchJson(url) {
+  const res = await fetch(url, { next: { revalidate: 0 } });
+  const raw = await res.text();
   try {
-    const u = new URL(catalogUrl);
-    // 去掉檔名與 query，保留到包含 /modules/ 的目錄
-    const noQuery = new URL(u.origin + u.pathname);
-    const parts = noQuery.pathname.split('/');
-    parts.pop(); // 移除 catalog.json
-    const basePath = parts.join('/') + '/';
-    return noQuery.origin + basePath; // .../modules/
+    return JSON.parse(raw);
   } catch {
-    return catalogUrl.replace(/catalog\.json.*/i, '');
-  }
-}
-
-function toAbsoluteUrl(pathOrUrl, base) {
-  if (!pathOrUrl) return '';
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  const clean = pathOrUrl.replace(/^\.?\/*/, '');
-  return new URL(clean, base).href;
-}
-
-async function fetchJson(url, timeoutMs = 2000) {
-  const ctrl = new AbortController();
-  const id = setTimeout(() => ctrl.abort(), timeoutMs);
-  try {
-    const r = await fetch(url, { cache: 'no-store', signal: ctrl.signal });
-    if (!r.ok) throw new Error(`HTTP ${r.status}`);
-    return await r.json();
-  } finally {
-    clearTimeout(id);
+    return JSON.parse(sanitizeJson(raw));
   }
 }
 
 export async function GET(req) {
   const { searchParams } = new URL(req.url);
-  const q = norm(searchParams.get('q'));
-  const limitRaw = parseInt(searchParams.get('limit') || '20', 10);
-  const limit = Number.isFinite(limitRaw) ? Math.max(1, Math.min(50, limitRaw)) : 20;
+  const q = (searchParams.get('q') || '').toLowerCase().trim();
+  const limit = Math.min(parseInt(searchParams.get('limit') || '20', 10), 50);
 
-  const CATALOG_URL = process.env.CATALOG_URL;
-  const GROUPS = (process.env.MODULES_GROUPS || '')
+  const CATALOG_URL = process.env.CATALOG_URL || '';
+  const GROUPS_ENV = (process.env.MODULES_GROUPS || '')
     .split(',')
     .map(s => s.trim())
     .filter(Boolean);
 
+  const errors = [];
+  const items = [];
+
   if (!CATALOG_URL) {
-    return NextResponse.json({ items: [], error: 'CATALOG_URL not set' }, { status: 500 });
+    return NextResponse.json({ items: [], errors: ['CATALOG_URL not set'] }, { headers: { 'Cache-Control': 'no-store' } });
   }
 
-  const timeoutMs = parseInt(process.env.CATALOG_TIMEOUT_MS || '2000', 10);
-  const ts = searchParams.get('_ts') || nowTs();
   try {
-    const catUrl = CATALOG_URL + (CATALOG_URL.includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
-    const catalog = await fetchJson(catUrl, timeoutMs);
-    const base = rawBaseFromCatalog(CATALOG_URL);
+    // 1) 基底用 …/main/，避免變成 modules/modules
+    const base = CATALOG_URL.replace(/\/modules\/catalog\.json.*$/i, '/');
 
-    const selectedGroups = (catalog.groups || []).filter(g => (GROUPS.length ? GROUPS.includes(g.id) : true));
-    const allModules = [];
+    // 2) 讀 catalog.json
+    const catalog = await fetchJson(CATALOG_URL);
+    const allGroups = Array.isArray(catalog.groups) ? catalog.groups : [];
+    const groups = allGroups.filter(g => !GROUPS_ENV.length || GROUPS_ENV.includes(g.id));
 
-    for (const g of selectedGroups) {
-      const fileUrl = toAbsoluteUrl(g.path, base);
+    // 3) 逐一載入 *_modules_all.json，合併過濾
+    for (const g of groups) {
+      const url = new URL(g.path, base).toString();
       try {
-        const urlWithTs = fileUrl + (fileUrl.includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
-        const data = await fetchJson(urlWithTs, timeoutMs);
-        const arr = Array.isArray(data?.modules) ? data.modules : [];
-        for (const m of arr) allModules.push(m);
-      } catch {
-        // 忽略單一 group 失敗，保持韌性
+        const data = await fetchJson(url);
+        const list = Array.isArray(data.modules) ? data.modules : [];
+        for (const m of list) {
+          const hay = `${m.id || ''} ${m.name || ''} ${Array.isArray(m.tags) ? m.tags.join(' ') : ''}`.toLowerCase();
+          if (!q || hay.includes(q)) {
+            items.push({ ...m, group: g.id });
+            if (items.length >= limit) break;
+          }
+        }
+        if (items.length >= limit) break;
+      } catch (e) {
+        errors.push(`load fail: ${url} ${String(e && e.message || e)}`);
       }
     }
-
-    let items = allModules;
-    if (q) {
-      items = items.filter(m => {
-        const id = norm(m.id);
-        const name = norm(m.name);
-        const tags = Array.isArray(m.tags) ? m.tags.map(norm) : [];
-        return id.includes(q) || name.includes(q) || tags.some(t => t.includes(q));
-      });
-    }
-    return NextResponse.json({ items: items.slice(0, limit) }, { headers: { 'Cache-Control': 'no-store' } });
   } catch (e) {
-    return NextResponse.json({ items: [], error: String(e?.message || e) }, { status: 500 });
+    errors.push(String(e && e.message || e));
   }
+
+  return NextResponse.json(
+    { items: items.slice(0, limit), errors },
+    { headers: { 'Cache-Control': 'no-store' } }
+  );
 }
