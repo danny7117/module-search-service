@@ -1,56 +1,55 @@
+// module-search-service/app/api/debug/route.js
 import { NextResponse } from 'next/server';
 
-export const dynamic = 'force-dynamic';
-export const runtime = 'nodejs';
-
-function rawBaseFromCatalog(catalogUrl) {
-  try {
-    const u = new URL(catalogUrl);
-    const noQuery = new URL(u.origin + u.pathname);
-    const parts = noQuery.pathname.split('/');
-    parts.pop();
-    const basePath = parts.join('/') + '/';
-    return noQuery.origin + basePath;
-  } catch {
-    return catalogUrl.replace(/catalog\.json.*/i, '');
-  }
-}
-function toAbsoluteUrl(pathOrUrl, base) {
-  if (!pathOrUrl) return '';
-  if (/^https?:\/\//i.test(pathOrUrl)) return pathOrUrl;
-  const clean = pathOrUrl.replace(/^\.?\/*/, '');
-  return new URL(clean, base).href;
+function sanitizeJson(text) {
+  return text
+    .replace(/^\uFEFF/, '')
+    .replace(/\/\/.*$/gm, '')
+    .replace(/\/\*[\s\S]*?\*\//g, '')
+    .replace(/,\s*([}\]])/g, '$1');
 }
 
-export async function GET() {
+async function fetchJson(url) {
+  const res = await fetch(url, { next: { revalidate: 0 } });
+  const raw = await res.text();
+  try { return JSON.parse(raw); }
+  catch { return JSON.parse(sanitizeJson(raw)); }
+}
+
+export async function GET(req) {
+  const CATALOG_URL = process.env.CATALOG_URL || '';
+  const GROUPS_ENV = (process.env.MODULES_GROUPS || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
   const out = {
-    CATALOG_URL: process.env.CATALOG_URL,
-    MODULES_GROUPS: (process.env.MODULES_GROUPS || '').split(',').map(s => s.trim()).filter(Boolean),
+    CATALOG_URL,
+    MODULES_GROUPS: GROUPS_ENV,
     loaded: [],
     errors: [],
-    catalog_ok: false
+    catalog_ok: false,
   };
-  try {
-    const ts = Date.now();
-    const catUrl = out.CATALOG_URL + (out.CATALOG_URL.includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
-    const catalog = await fetch(catUrl, { cache: 'no-store' }).then(r => r.json());
-    out.catalog_ok = !!catalog?.groups?.length;
-    const base = rawBaseFromCatalog(out.CATALOG_URL);
 
-    const targets = (catalog.groups || []).filter(g => (out.MODULES_GROUPS.length ? out.MODULES_GROUPS.includes(g.id) : true));
-    for (const g of targets) {
-      const fileUrl = toAbsoluteUrl(g.path, base);
+  try {
+    const base = CATALOG_URL.replace(/\/modules\/catalog\.json.*$/i, '/');
+    const catalog = await fetchJson(CATALOG_URL);
+    out.catalog_ok = !!(catalog && catalog.groups && catalog.groups.length);
+    const groups = (catalog.groups || []).filter(g => !GROUPS_ENV.length || GROUPS_ENV.includes(g.id));
+
+    for (const g of groups) {
+      const url = new URL(g.path, base).toString();
       try {
-        const url = fileUrl + (fileUrl.includes('?') ? `&_ts=${ts}` : `?_ts=${ts}`);
-        const json = await fetch(url, { cache: 'no-store' }).then(r => r.json());
-        const count = Array.isArray(json?.modules) ? json.modules.length : 0;
-        out.loaded.push({ id: g.id, path: g.path, resolved: fileUrl, count });
+        const data = await fetchJson(url);
+        const count = Array.isArray(data.modules) ? data.modules.length : 0;
+        out.loaded.push({ id: g.id, path: g.path, url, count });
       } catch (e) {
-        out.errors.push(`load fail: ${fileUrl} :: ${String(e?.message || e)}`);
+        out.errors.push(`load fail: ${url} ${String(e && e.message || e)}`);
       }
     }
   } catch (e) {
-    out.errors.push(`catalog fail: ${String(e?.message || e)}`);
+    out.errors.push(String(e && e.message || e));
   }
+
   return NextResponse.json(out, { headers: { 'Cache-Control': 'no-store' } });
 }
